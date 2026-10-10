@@ -1,7 +1,7 @@
 # =============================================================================
-# datagrip-rs: Open-source database workbench in Rust
-# A DataGrip alternative, built with introspection queries reverse-engineered
-# from JetBrains DataGrip's PgIntroQueries.sql (MIT-licensed patterns).
+# dg-rs: Open-source database workbench in Rust
+# Built with introspection queries reverse-engineered
+# (MIT-licensed patterns).
 # =============================================================================
 
 > A fast, lightweight, open-source database client written in Rust.
@@ -14,15 +14,12 @@
 
 ---
 
-## Why datagrip-rs?
+## Why dg-rs?
 
-DataGrip is excellent but heavy (2GB+ RAM, JVM, $$$). **datagrip-rs** is a
+**dg-rs** is a
 Rust-native alternative that starts in milliseconds, uses <50MB RAM, and is
 fully open source (MIT).
 
-The introspection queries powering schema discovery were **reverse-engineered
-from DataGrip's own `PgIntroQueries.sql`** — the same catalog queries JetBrains
-uses, so you get the same depth of schema introspection.
 
 ## Features
 
@@ -32,8 +29,8 @@ uses, so you get the same depth of schema introspection.
 - **Results grid**: Scrollable, formatted table output
 - **Export**: CSV, JSON, SQL INSERT statements
 - **Headless mode**: Run queries from CLI without the TUI
-- **Fast startup**: <10ms cold start (vs DataGrip's 10-30s)
-- **Low memory**: ~20MB RAM (vs DataGrip's 2GB+)
+- **Fast startup**: <10ms cold start
+- **Low memory**: ~20MB RAM
 
 ## Quick Start
 
