@@ -40,7 +40,75 @@ impl PostgresDb {
 impl Database for PostgresDb {
     async fn connect(&mut self) -> anyhow::Result<()> {
         let conn_str = self.build_connect_string();
-        let (client, connection) = tokio_postgres::connect(&conn_str, NoTls).await?;
+
+        // Pre-flight TCP check: gives a much better error message than
+        // tokio-postgres's generic "invalid connection string"
+        let tcp_result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tokio::net::TcpStream::connect(format!("{}:{}", self.config.host, self.config.port)),
+        )
+        .await;
+
+        match tcp_result {
+            Ok(Ok(_)) => {
+                // TCP port is open — proceed with full PG connection
+            }
+            Ok(Err(e)) => {
+                let host = &self.config.host;
+                let port = self.config.port;
+                let lower = format!("{}", e).to_lowercase();
+                let hint = if lower.contains("refused") {
+                    format!(
+                        "Connection refused at {}:{}. Is PostgreSQL running? Check: pg_isready -h {} -p {}",
+                        host, port, host, port
+                    )
+                } else if lower.contains("timed out") || lower.contains("timeout") {
+                    format!(
+                        "Connection to {}:{} timed out. Check firewall, network, or if the server is up.",
+                        host, port
+                    )
+                } else if lower.contains("unreachable") || lower.contains("network") {
+                    format!(
+                        "Network unreachable for {}:{}. Check your network connection and VPN.",
+                        host, port
+                    )
+                } else {
+                    format!("TCP connection to {}:{} failed: {}", host, port, e)
+                };
+                return Err(anyhow::anyhow!("{}", hint));
+            }
+            Err(_) => {
+                return Err(anyhow::anyhow!(
+                    "Connection to {}:{} timed out after 5 seconds. The host may be unreachable or firewalled.",
+                    self.config.host, self.config.port
+                ));
+            }
+        }
+
+        // TCP is fine — now do the actual PostgreSQL handshake
+        let (client, connection) = tokio_postgres::connect(&conn_str, NoTls)
+            .await
+            .map_err(|e| {
+                let host = &self.config.host;
+                let port = self.config.port;
+                let db = &self.config.database;
+                let user = &self.config.user;
+                let err_str = format!("{}", e);
+                let lower = err_str.to_lowercase();
+
+                // Provide specific guidance based on the error type
+                let hint = if lower.contains("password") || lower.contains("authentication") || lower.contains("sasl") {
+                    format!("Authentication failed for user '{}'. Check the password (set PGPASSWORD env var).", user)
+                } else if lower.contains("database") && (lower.contains("not") || lower.contains("exist")) {
+                    format!("Database '{}' does not exist on {}:{}.", db, host, port)
+                } else if lower.contains("permission") || lower.contains("denied") {
+                    format!("Permission denied for user '{}' on database '{}'.", user, db)
+                } else {
+                    format!("PostgreSQL handshake failed at {}:{} (db: {}, user: {}): {}", host, port, db, user, e)
+                };
+
+                anyhow::anyhow!("{}", hint)
+            })?;
 
         // Spawn the connection handler
         tokio::spawn(async move {
@@ -196,6 +264,7 @@ impl Database for PostgresDb {
 }
 
 /// Format a cell value from a tokio-postgres row into an Option<String>.
+/// Uses the column's OID to determine the type, with graceful fallbacks.
 fn format_cell(
     row: &tokio_postgres::Row,
     idx: usize,
@@ -203,59 +272,70 @@ fn format_cell(
 ) -> Option<String> {
     use tokio_postgres::types::Type;
 
-    // Check for NULL first via try_get on the raw bytes
-    let is_null = row.try_get::<_, Option<String>>(idx).ok().flatten().is_none()
-        && row.try_get::<_, Option<i64>>(idx).ok().flatten().is_none()
-        && row.try_get::<_, Option<bool>>(idx).ok().flatten().is_none();
-
-    if is_null && row.try_get::<_, Option<Vec<u8>>>(idx).ok().flatten().is_none() {
-        return None;
-    }
-
+    // Fast NULL check: try to get as Option<String> — if the value is NULL,
+    // this returns Ok(None). But other types may fail to decode as String,
+    // so we can't rely on try_get alone. Instead, check by type.
     let result: Option<String> = match *pg_type {
-        Type::BOOL => row.get::<_, Option<bool>>(idx).map(|v| v.to_string()),
-        Type::INT2 => row.get::<_, Option<i16>>(idx).map(|v| v.to_string()),
-        Type::INT4 => row.get::<_, Option<i32>>(idx).map(|v| v.to_string()),
-        Type::INT8 => row.get::<_, Option<i64>>(idx).map(|v| v.to_string()),
-        Type::FLOAT4 => row.get::<_, Option<f32>>(idx).map(|v| v.to_string()),
-        Type::FLOAT8 => row.get::<_, Option<f64>>(idx).map(|v| v.to_string()),
-        Type::TEXT | Type::VARCHAR | Type::NAME => row.get::<_, Option<String>>(idx),
+        Type::BOOL => row.try_get::<_, Option<bool>>(idx).ok().flatten().map(|v| v.to_string()),
+        Type::INT2 => row.try_get::<_, Option<i16>>(idx).ok().flatten().map(|v| v.to_string()),
+        Type::INT4 => row.try_get::<_, Option<i32>>(idx).ok().flatten().map(|v| v.to_string()),
+        Type::INT8 => row.try_get::<_, Option<i64>>(idx).ok().flatten().map(|v| v.to_string()),
+        Type::FLOAT4 => row.try_get::<_, Option<f32>>(idx).ok().flatten().map(|v| v.to_string()),
+        Type::FLOAT8 => row.try_get::<_, Option<f64>>(idx).ok().flatten().map(|v| v.to_string()),
+        Type::TEXT | Type::VARCHAR | Type::NAME | Type::BPCHAR => {
+            row.try_get::<_, Option<String>>(idx).ok().flatten()
+        }
         Type::JSON | Type::JSONB => {
-            row.get::<_, Option<serde_json::Value>>(idx)
+            row.try_get::<_, Option<serde_json::Value>>(idx)
+                .ok()
+                .flatten()
                 .map(|v| v.to_string())
         }
         Type::BYTEA => row
-            .get::<_, Option<Vec<u8>>>(idx)
+            .try_get::<_, Option<Vec<u8>>>(idx)
+            .ok()
+            .flatten()
             .map(|v| format!("\\x{}", hex_encode(&v))),
         Type::TIMESTAMP => row
-            .get::<_, Option<chrono::NaiveDateTime>>(idx)
+            .try_get::<_, Option<chrono::NaiveDateTime>>(idx)
+            .ok()
+            .flatten()
             .map(|v| v.to_string()),
         Type::TIMESTAMPTZ => row
-            .get::<_, Option<chrono::DateTime<chrono::Utc>>>(idx)
+            .try_get::<_, Option<chrono::DateTime<chrono::Utc>>>(idx)
+            .ok()
+            .flatten()
             .map(|v| v.to_string()),
         Type::DATE => row
-            .get::<_, Option<chrono::NaiveDate>>(idx)
+            .try_get::<_, Option<chrono::NaiveDate>>(idx)
+            .ok()
+            .flatten()
             .map(|v| v.to_string()),
         Type::UUID => {
-            // UUID as bytes, format manually
-            row.get::<_, Option<Vec<u8>>>(idx).map(|v| {
-                if v.len() == 16 {
-                    format!(
-                        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-                        v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7],
-                        v[8], v[9], v[10], v[11], v[12], v[13], v[14], v[15]
-                    )
-                } else {
-                    hex_encode(&v)
-                }
-            })
+            // UUID without the uuid crate: read as string (tokio-postgres can decode UUID as String in text mode)
+            // or as raw bytes
+            row.try_get::<_, Option<String>>(idx)
+                .ok()
+                .flatten()
+                .or_else(|| {
+                    row.try_get::<_, Option<Vec<u8>>>(idx)
+                        .ok()
+                        .flatten()
+                        .map(|v| {
+                            if v.len() == 16 {
+                                format!(
+                                    "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+                                    v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7],
+                                    v[8], v[9], v[10], v[11], v[12], v[13], v[14], v[15]
+                                )
+                            } else {
+                                hex_encode(&v)
+                            }
+                        })
+                })
         }
-        // NUMERIC comes as bytes - decode as text
-        Type::NUMERIC => row
-            .get::<_, Option<Vec<u8>>>(idx)
-            .map(|v| String::from_utf8_lossy(&v).to_string()),
-        _ => {
-            // Fallback: try as text, then as bytes
+        Type::NUMERIC => {
+            // NUMERIC is returned as bytes in binary format; try text representation
             row.try_get::<_, Option<String>>(idx)
                 .ok()
                 .flatten()
@@ -265,6 +345,28 @@ fn format_cell(
                         .flatten()
                         .map(|v| String::from_utf8_lossy(&v).to_string())
                 })
+        }
+        Type::OID => row.try_get::<_, Option<u32>>(idx).ok().flatten().map(|v| v.to_string()),
+        // Arrays: try as Vec<String> first, then as raw text
+        _ if pg_type.name().starts_with('_') => {
+            row.try_get::<_, Option<Vec<String>>>(idx)
+                .ok()
+                .flatten()
+                .map(|v| format!("{{{}}}", v.join(", ")))
+                .or_else(|| row.try_get::<_, Option<String>>(idx).ok().flatten())
+        }
+        _ => {
+            // Generic fallback: try as string, then as bytes
+            row.try_get::<_, Option<String>>(idx)
+                .ok()
+                .flatten()
+                .or_else(|| {
+                    row.try_get::<_, Option<Vec<u8>>>(idx)
+                        .ok()
+                        .flatten()
+                        .map(|v| String::from_utf8_lossy(&v).to_string())
+                })
+                .or(Some(format!("<{}>", pg_type.name())))
         }
     };
 

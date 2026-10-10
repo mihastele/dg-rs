@@ -21,16 +21,17 @@ use model::{ConnectionConfig, DbType};
 #[command(name = "datagrip-rs")]
 #[command(about = "Open-source database workbench in Rust — a DataGrip alternative")]
 #[command(version)]
+#[command(arg_required_else_help = true)]
 struct Cli {
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 
 #[derive(Subcommand)]
 enum Commands {
     /// Connect to a database and launch the interactive TUI.
     Connect {
-        /// Database type.
+        /// Database type: postgres, sqlite, mysql
         #[arg(value_name = "TYPE")]
         db_type: String,
 
@@ -119,7 +120,14 @@ fn parse_config(
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    match cli.command {
+    // No subcommand = show help and exit gracefully
+    let Some(command) = cli.command else {
+        // This is handled by arg_required_else_help, but just in case:
+        eprintln!("Usage: datagrip-rs <COMMAND>\n\nCommands:\n  connect     Connect to a database and launch the interactive TUI\n  query       Run a SQL query and print results (headless mode)\n  introspect  Introspect a database and print the schema tree\n\nOptions:\n  -h, --help     Print help\n  -V, --version  Print version");
+        std::process::exit(0);
+    };
+
+    match command {
         Commands::Connect {
             db_type,
             host,
@@ -305,17 +313,32 @@ fn print_table(result: &model::ResultSet) {
 
 async fn run_tui(config: ConnectionConfig) -> anyhow::Result<()> {
     use crossterm::{
-        event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
+        event::{self, Event},
         execute,
         terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     };
     use ratatui::{backend::CrosstermBackend, Terminal};
 
-    // Connect
-    let db = db::create_connection(&config).await?;
-    println!("Connected to {}", config.connection_string());
+    // Connect first — if this fails, print error to stderr and exit cleanly
+    // (no TUI cleanup needed since we haven't touched the terminal yet)
+    let db = match db::create_connection(&config).await {
+        Ok(db) => db,
+        Err(e) => {
+            eprintln!("\n❌ Connection failed: {}", e);
+            eprintln!("   Target: {}", config.connection_string());
+            eprintln!("\n   Check that:");
+            eprintln!("   - The database server is running");
+            eprintln!("   - Host/port are correct");
+            eprintln!("   - Credentials are correct (set PGPASSWORD env var for PostgreSQL)");
+            eprintln!("   - For SQLite, the file path exists");
+            std::process::exit(1);
+        }
+    };
 
-    // Setup terminal
+    // Print connection info before entering TUI (visible if TUI fails to start)
+    eprintln!("Connected to {}", config.connection_string());
+
+    // Setup terminal — wrap in a guard so we always restore on panic/error
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
@@ -334,27 +357,37 @@ async fn run_tui(config: ConnectionConfig) -> anyhow::Result<()> {
         }
     }
 
-    // Event loop
-    loop {
-        terminal.draw(|f| app.render(f))?;
+    // Event loop with panic safety
+    let loop_result: anyhow::Result<()> = async {
+        loop {
+            terminal.draw(|f| app.render(f))?;
 
-        if event::poll(std::time::Duration::from_millis(100))? {
-            if let Event::Key(key) = event::read()? {
-                if handle_key(&mut app, key).await {
-                    break;
+            if event::poll(std::time::Duration::from_millis(100))? {
+                if let Event::Key(key) = event::read()? {
+                    if handle_key(&mut app, key).await {
+                        break;
+                    }
                 }
             }
-        }
 
-        if app.should_quit {
-            break;
+            if app.should_quit {
+                break;
+            }
         }
+        Ok(())
     }
+    .await;
 
-    // Restore terminal
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
+    // ALWAYS restore terminal, even on error
+    let _ = disable_raw_mode();
+    let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
+    let _ = terminal.show_cursor();
+
+    // If the loop errored, report it after terminal is restored
+    if let Err(e) = loop_result {
+        eprintln!("\n❌ TUI error: {}", e);
+        return Err(e);
+    }
 
     Ok(())
 }
