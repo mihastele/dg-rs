@@ -46,6 +46,19 @@ impl ConnectionConfig {
         }
     }
 
+    pub fn mysql(host: &str, port: u16, database: &str, user: &str) -> Self {
+        Self {
+            name: format!("{}@{}", user, host),
+            db_type: DbType::MySql,
+            host: host.to_string(),
+            port,
+            database: database.to_string(),
+            user: user.to_string(),
+            password_env: Some("MYSQL_PWD".to_string()),
+            file_path: None,
+        }
+    }
+
     pub fn connection_string(&self) -> String {
         match self.db_type {
             DbType::Postgres => format!(

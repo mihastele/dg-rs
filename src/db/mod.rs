@@ -4,11 +4,12 @@
 use crate::model::{ConnectionConfig, DbType, ResultSet, Schema};
 use async_trait::async_trait;
 
+pub mod mysql;
 pub mod postgres;
 pub mod sqlite;
 
 #[async_trait]
-pub trait Database: Send {
+pub trait Database: Send + Sync {
     /// Test the connection.
     async fn connect(&mut self) -> anyhow::Result<()>;
 
@@ -46,6 +47,10 @@ pub async fn create_connection(
             db.connect().await?;
             Ok(Box::new(db))
         }
-        DbType::MySql => anyhow::bail!("MySQL support coming in v0.2"),
+        DbType::MySql => {
+            let mut db = mysql::MysqlDb::new(config.clone());
+            db.connect().await?;
+            Ok(Box::new(db))
+        }
     }
 }

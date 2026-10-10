@@ -37,9 +37,9 @@ enum Commands {
 
         #[arg(long, default_value = "localhost")]
         host: String,
-        #[arg(long, default_value = "5432")]
-        port: u16,
-        #[arg(long, default_value = "postgres")]
+        #[arg(long)]
+        port: Option<u16>,
+        #[arg(long, default_value = "")]
         db: String,
         #[arg(long, default_value = "postgres")]
         user: String,
@@ -56,9 +56,9 @@ enum Commands {
 
         #[arg(long, default_value = "localhost")]
         host: String,
-        #[arg(long, default_value = "5432")]
-        port: u16,
-        #[arg(long, default_value = "postgres")]
+        #[arg(long)]
+        port: Option<u16>,
+        #[arg(long, default_value = "")]
         db: String,
         #[arg(long, default_value = "postgres")]
         user: String,
@@ -81,9 +81,9 @@ enum Commands {
 
         #[arg(long, default_value = "localhost")]
         host: String,
-        #[arg(long, default_value = "5432")]
-        port: u16,
-        #[arg(long, default_value = "postgres")]
+        #[arg(long)]
+        port: Option<u16>,
+        #[arg(long, default_value = "")]
         db: String,
         #[arg(long, default_value = "postgres")]
         user: String,
@@ -95,22 +95,24 @@ enum Commands {
 fn parse_config(
     db_type: &str,
     host: &str,
-    port: u16,
+    port: Option<u16>,
     db: &str,
     user: &str,
     file: Option<String>,
 ) -> anyhow::Result<ConnectionConfig> {
     match db_type.to_lowercase().as_str() {
-        "postgres" | "postgresql" | "pg" => Ok(ConnectionConfig::postgres(host, port, db, user)),
+        "postgres" | "postgresql" | "pg" => {
+            let port = port.unwrap_or(5432);
+            let db = if db.is_empty() { "postgres" } else { db };
+            Ok(ConnectionConfig::postgres(host, port, db, user))
+        }
         "sqlite" | "sqlite3" => {
             let path = file.ok_or_else(|| anyhow::anyhow!("SQLite requires --file <path>"))?;
             Ok(ConnectionConfig::sqlite(&path, &path))
         }
         "mysql" | "mariadb" => {
-            let mut cfg = ConnectionConfig::postgres(host, port, db, user);
-            cfg.db_type = DbType::MySql;
-            cfg.name = format!("{}@{}", user, host);
-            Ok(cfg)
+            let port = port.unwrap_or(3306);
+            Ok(ConnectionConfig::mysql(host, port, db, user))
         }
         other => anyhow::bail!("Unknown database type: '{}'. Use: postgres, sqlite, mysql", other),
     }
@@ -364,6 +366,13 @@ async fn run_tui(config: ConnectionConfig) -> anyhow::Result<()> {
 
             if event::poll(std::time::Duration::from_millis(100))? {
                 if let Event::Key(key) = event::read()? {
+                    // On Windows, crossterm emits KeyEventKind::Press AND KeyEventKind::Release
+                    // for every key. We only want to handle Press events, otherwise every
+                    // keystroke is processed twice (typing 'c' produces 'cc').
+                    // KeyEventKind::Repeat is for OS key-repeat (holding a key down) — handle it too.
+                    if key.kind == crossterm::event::KeyEventKind::Release {
+                        continue;
+                    }
                     if handle_key(&mut app, key).await {
                         break;
                     }
